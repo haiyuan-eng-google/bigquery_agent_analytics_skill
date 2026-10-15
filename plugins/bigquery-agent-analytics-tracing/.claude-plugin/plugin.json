@@ -20,7 +20,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -30,7 +31,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/user_prompt_submit.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/user_prompt_submit.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -40,7 +42,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -50,7 +53,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_use.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_use.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -60,7 +64,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -70,7 +75,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/subagent_stop.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/subagent_stop.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -80,7 +86,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/notification.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/notification.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -90,7 +97,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/permission_request.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/permission_request.sh\"",
+            "timeout": 10
           }
         ]
       }

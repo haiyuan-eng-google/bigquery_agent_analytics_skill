@@ -15,9 +15,13 @@ and per-channel reference snippets.
 ## How it works
 
 ```
-Claude Code hook (bash)  ->  bqaa_hook.py  ->  spool/event-*.json   (sync, ~1 ms)
-                                             |
-                                             +-> spawn detached drainer
+Agent hook (bash, <= BQAA_HOOK_WAIT_SECONDS in all, always exits 0)
+        |
+        +-> queue/<seq>   (the event, in hook order)
+        |
+        +-> bqaa_hook.py (background)  ->  spool/event-*.json   (~1 ms)
+              applies the session's            |
+              queued events, oldest first      +-> spawn detached drainer
                                                        |
                                                        v
                               bqaa_drain.py  ->  BigQuery Storage Write API
@@ -25,7 +29,22 @@ Claude Code hook (bash)  ->  bqaa_hook.py  ->  spool/event-*.json   (sync, ~1 ms
                                                    dead-lettered on failure)
 ```
 
-The hot path that runs inside the agent process never blocks on BigQuery.
+The hook script the agent waits on runs only bash and base utilities
+(`dirname`, `cat`, `mkdir`, rarely `rm`). It writes the event to a
+numbered file under `BQAA_STATE_DIR/queue`, starts `bqaa_hook.py` detached
+from the hook's stdio and waits for it. The whole hook, reading the
+payload included, is bounded by `BQAA_HOOK_WAIT_SECONDS` (default 1; see
+Reliability for the exact bound). So the agent never waits on Python startup, file locks, auth
+or BigQuery, nor on a sender that doesn't close stdin. Each `bqaa_hook.py`
+run applies all of its session's queued events,
+oldest first, each as of the time its hook ran. An event's session is the
+top-level `session_id` of its payload, which `bqaa_hook.py` reads from the
+whole payload, wherever the field sits in it. When one run starts late,
+another applies its event in turn, so a late `UserPromptSubmit` still opens
+the trace before its `Stop` reads the reply, and timestamps and latencies
+come out as if nothing was late. Without `BQAA_PROJECT_ID`/`BQAA_DATASET`
+(and outside dry-run) the hook exits without starting Python at all.
+
 The drainer is a single-instance background process (enforced by
 `fcntl.flock`) that batches spooled rows and writes them via the
 `BigQueryWriteAsyncClient` Storage Write API. If the Storage Write client
@@ -63,8 +82,10 @@ export BQAA_DRAIN_BATCH_SIZE="50"
 export BQAA_DRAIN_IDLE_SECONDS="8"
 export BQAA_DRAIN_POLL_SECONDS="0.5"
 export BQAA_TRANSCRIPT_MAX_BYTES="262144"     # 256 KB cap for SubagentStop transcripts
-export BQAA_STATE_TTL_HOURS="24"              # purge orphaned state files older than this
+export BQAA_STATE_TTL_HOURS="24"              # purge orphaned state and queue files older than this
 export BQAA_WRITER_LABEL="bqaa-coding-agent-plugin/0.1.0"   # see "Writer attribution" below
+export BQAA_HOOK_WAIT_SECONDS="1"             # whole seconds a hook may take in all; 0 = don't wait for bqaa_hook.py
+export BQAA_NETWORK_TIMEOUT_SECONDS="30"      # hard timeout on each ADC lookup / BigQuery call
 ```
 
 ### Authentication
@@ -441,10 +462,35 @@ ORDER BY rows_written DESC
 
 ## Reliability
 
-- **No agent latency from BigQuery.** The hook only writes to a local
-  JSONL file then exits. Even if BigQuery is degraded, your agent sees
-  the same per-tool overhead (~5–20 ms for spool + Popen, plus Python
-  startup).
+- **Hooks never block the agent.** The hook script takes at most
+  `BQAA_HOOK_WAIT_SECONDS`, plus under a second when the agent is slow to
+  send the payload or never closes stdin, and always exits 0 with no
+  output. Normally you see the queue + spool + Popen cost (~5–20 ms) plus
+  Python startup. If Python can't start (on macOS a hung `syspolicyd` can
+  block launching a non-Apple interpreter for many minutes) or anything
+  else stalls, a tool call pays at most the wait. Each hook also has a
+  10 s `timeout` in `plugin.json` as a backstop (the default is 600 s).
+- **Events apply in hook order.** The hook queues its event before it
+  returns, and whichever `bqaa_hook.py` run takes the session's lock first
+  applies all of that session's queued events, oldest first. A late
+  interpreter can't apply its event after a newer one, so a `Stop` never
+  misses its `UserPromptSubmit` and a `PostToolUse` never misses its
+  `PreToolUse`. Events are stamped with the time their hook ran. The
+  session comes from each whole payload's top-level `session_id`, so every
+  run reads all queued payloads (normally only a handful). The lock files
+  (`queue/.lock-00` to `.lock-63`, picked by session) are never removed, so
+  two runs can't both hold a session's lock. Queue numbers are never
+  reused (`queue/last` holds the highest one removed so far), so a run
+  reading the queue in order can't find a newer event under a number it
+  has passed. A payload Python can't parse (cut off, nested too deeply, or
+  holding an integer too long to convert) is dropped with a log line and
+  holds up nothing else. If no
+  `bqaa_hook.py` run gets going for a session again, its queued events
+  stay put until `BQAA_STATE_TTL_HOURS` purges them; past 10,000 queued
+  events in all, hooks stop queueing new ones.
+- **Hard network timeouts.** Every ADC lookup and BigQuery call, in the
+  drainer and in direct-write mode, gives up after
+  `BQAA_NETWORK_TIMEOUT_SECONDS` (default 30).
 - **Single-writer drainer.** Multiple hook fires can't double-write
   because the drainer is gated by `fcntl.flock` on a pidfile. The
   drainer exits after `BQAA_DRAIN_IDLE_SECONDS` of empty polling; the
@@ -452,7 +498,18 @@ ORDER BY rows_written DESC
 - **Retries.** Transient `ServiceUnavailable`, `TooManyRequests`,
   `InternalServerError`, and timeout errors are retried with
   exponential backoff (matches ADK's `RetryConfig` defaults: 3 retries,
-  1 s initial, 2× multiplier, 10 s cap).
+  1 s initial, 2× multiplier, 10 s cap). `insert_rows_json` attempts all
+  carry the same insertIds (each row's content hash), so BigQuery drops a
+  resent row it already has. A timed-out insert is never resent while it
+  may still land: the drainer waits out the backoff for its result instead,
+  and if it's still running after that, the batch is dead-lettered.
+- **Delivery isn't exactly-once.** BigQuery's insertId dedupe is best
+  effort and only holds for a short window. A batch dead-lettered after a
+  timed-out insert may be in the table already. The Storage Write default
+  stream is at-least-once: an append that timed out may have landed, so its
+  retry, or the `insert_rows_json` fallback after it, can write those rows
+  twice. A written-twice row is an exact copy, so for exact counts dedupe
+  on `event_type`, `span_id` and `timestamp` in queries.
 - **Dead-letter.** Permanently-failed rows move to
   `BQAA_SPOOL_DIR/dead-letter/` for manual inspection and replay.
 - **Race-free state.** The per-session state file is read-modify-written
