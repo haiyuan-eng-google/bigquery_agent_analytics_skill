@@ -1075,10 +1075,63 @@ column. Treat the dataset like the transcripts it mirrors.
   tokens, GitHub/GitLab/npm/Slack/Stripe tokens, JWTs and `Bearer`/`Basic`
   credentials; in URLs, the user-info part and credential-named query or
   fragment parameters, and incoming-webhook URLs (Slack, Discord, Office)
-  whole; and after a credential name followed by `:` or `=` (a header, a
-  YAML or `.env` line, a JSON key in text, an assignment) everything to the
-  end of the line, whatever it holds, including a redaction marker
-  (`?name=` / `&name=` only to the next `&`). A name is a credential's when
+  whole; after a credential name followed by `:` or `=` (a header, a
+  YAML or `.env` line, a JSON key in text, an assignment, a command-line flag
+  such as `--password=…` or `-Dssl.password=…`, a name the shell joins from
+  quoted, escaped or continued parts, such as `"DB_PASS"WORD=…`, also right
+  after another option's `=`, as in `--from-literal=pass"word"=…`) everything
+  to the end of the
+  line, whatever it holds, including a redaction marker (`?name=` / `&name=`
+  only to the next `&`, or through its shell word if that is longer when a
+  quote, `$` or a backtick opens the value or `;` or `&` comes before the
+  name), and on to the next lines after a line continuation,
+  or as far as the value runs on: after `=` with no space around it (a flag or
+  an assignment), through the whole shell word it starts, to the end of the
+  line that word ends on (a flag's value, to a `;`, `|`, `&`, `<`, `>` or `)`
+  that ends its word: `--password=x;echo ok` keeps `;echo ok`); otherwise
+  through a quote that opens the value, to the end of the
+  line it closes on (anything left open, to the end of the text); and after a
+  long command-line option whose name's last part is a credential word
+  (`--password VALUE`, `--api-key "VALUE"`, `--pass -VALUE`, `"--password"
+  VALUE`, the value after a line continuation too, the option's word read as
+  the shell passes it: line continuations, quotes, backslashes and ANSI-C
+  escapes in its name, and an `=` inside a quote) its whole shell argument.
+  A credential's shell word is read by a few simple rules only: plain and
+  backslash-escaped characters, single-quoted parts and double-quoted parts
+  with no expansion, joined, up to the first space, tab, line break, `;`,
+  `|`, `&`, `<`, `>` or `)` outside them; a quote it starts in (an option in
+  a quote, `"--password a b"`) is put back after the marker. Where its end
+  cannot be told with certainty, the value runs to the end of the text, and
+  everything after it goes with it: when it holds or starts with `$(…)`,
+  `${…}`, `$[…]`, a backtick, `$'…'`, `$"…"`, `(`, `<(` or `>(`, a line
+  continuation, a quote that does not close, an escaped quote, backslash, `$`
+  or backtick outside quotes (which a command string's quoting can leave in),
+  or a redirection before it (`--password 2>&1 VALUE`); when the quote it
+  starts in closes with more of its word joined after it (`"PASSWORD="a b"`,
+  where that quote may be an outer string's, such as JSON's); and when that
+  quote is not known: a scan of the whole text from its start (quotes,
+  backslashes, `$'…'` and comments only) and the value's word read alone
+  from its start disagree on it, as after an apostrophe or an odd quote in
+  prose, in a command string another shell runs (`sh -c "… --password
+  \"a b\" …"`, `ssh host '… --password a b'`) or after an escaped quote in
+  the option's word; or the scan cannot read the text before it (past any
+  `<<` other than `<<<`, such as a here-document's, a comment that ends in a
+  backslash, a `#` right after an operator, or a backtick that does not
+  close). So `It's here: cli --password 'a b' --verbose` keeps only
+  `It's here: cli --password [REDACTED]`, and `cli --password $(cat f)
+  --verbose` only `cli --password [REDACTED]`: that over-redaction is the
+  price of never keeping part of a credential. A line continuation with no
+  space beside it right after a credential option's name glues what follows
+  to it, which goes to the end of the text too (`--password\` and `VALUE`,
+  `--pass\` and `"word" VALUE`), unless it carries the name on into another
+  option (`--password\` and `-stdin`, `"--password"\` and `"-stdin"`). A word
+  of a command string another shell runs is also read with every quote,
+  backslash and line continuation dropped, to find an option or a name the
+  shell would pass (`\"--pass\"word`, `--pa\\ssword`, `'\''--password'\''=`),
+  whose value then runs to the end of the text. A value that is one
+  redaction marker alone is kept, and a word that starts with `--` is no
+  value (`--password-stdin`, also as `--password\` and `"-stdin"`, and
+  `--token-file` keep theirs). A name is a credential's when
   one of its parts, split on punctuation and camelCase and compared without
   case, is `pass`, `passwd`, `password`, `passphrase`, `pwd`, `secret`,
   `token`, `auth`, `authorization`, `cookie`, `session`, `key`, `apikey`,
@@ -1104,7 +1157,8 @@ column. Treat the dataset like the transcripts it mirrors.
   a multi-megabyte tool input costs the hot path milliseconds (a test checks
   under 100 ms for a 2,760,000-character Write). A long string is scanned up
   to 8,192 characters past where it is cut, so a credential across the cut is
-  still matched whole; anything further is dropped, never passed on unscanned.
+  still matched whole; those last 8,192 characters scanned are never kept,
+  and anything further is dropped, never passed on unscanned.
   Cut rows have `is_truncated = true`.
 * **Local files:** dead-letter and dry-run files hold the same redacted rows
   as the table; they are written with your user's default permissions.
@@ -1162,7 +1216,10 @@ too long or broken to parse however it opens, key names that hold a
 credential (in nested objects, JSON text and tool arguments), credential
 names in text with their parts, endings, plural and numbered forms, URLs and
 webhook URLs,
-credential-named lines whatever they hold, values past 5,000 characters and
+credential-named lines whatever they hold, credential options and
+assignments whose value ends cleanly (the rest kept) or cannot be told
+(redacted to the end of the text, with a generated sweep of value openers),
+text with no credential left as it is, values past 5,000 characters and
 past the scanned window, credentials across a length cap, every diagnostic
 sink, and each review probe through capture, delivery and the dead-letter
 file),

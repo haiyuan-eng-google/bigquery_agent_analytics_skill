@@ -631,3 +631,816 @@ test('a huge tool input is cut inside args; tool and tool_origin survive', () =>
   expect(content.args.file_path).toBe('big.txt')
   expect(built.row.is_truncated).toBe(true)
 })
+
+test('credentials in command-line flags are removed, with = or a space before the value', () => {
+  const stats = newStats()
+  const out = (text: string): string => redactText(text, stats)
+  expect(out('docker login -u ci --password=Pr0dRegistryPass! registry.example.com')).toBe('docker login -u ci --password=[REDACTED]')
+  expect(out('tool --api-key=abc123def --verbose')).toBe('tool --api-key=[REDACTED]')
+  expect(out('gcloud x --client-secret=s3cr3tValue')).toBe('gcloud x --client-secret=[REDACTED]')
+  expect(out('java -Djavax.net.ssl.trustStorePassword=changeit -jar app.jar')).toBe('java -Djavax.net.ssl.trustStorePassword=[REDACTED]')
+  expect(out('docker login --username ci --password Pr0dRegistryPass! registry.example.com')).toBe('docker login --username ci --password [REDACTED] registry.example.com')
+  expect(out('tool --api-key "two words" --verbose')).toBe('tool --api-key [REDACTED] --verbose')
+  expect(out("curl --cookie 'id=1; theme=dark' https://example.com/")).toBe('curl --cookie [REDACTED] https://example.com/')
+  // Not credentials, or no value after the space: kept as they are.
+  for (const kept of ['ls --color=auto -la', 'ls --color auto', 'docker login --password-stdin registry.example.com',
+    'tool --token-file /etc/token --verbose', 'cli --max-tokens 1024', 'cli --password --verbose', 'cli --password\nnext line']) {
+    expect(out(kept)).toBe(kept)
+  }
+  expect(out('tool --token [REDACTED:github-token] --verbose')).toBe('tool --token [REDACTED:github-token] --verbose')
+})
+
+test('a long string never passes on a credential its scan window cut short', () => {
+  // A long credential line shrinks the scanned window by more than the scan
+  // margin; a token at the window's end, cut there, no longer matches its
+  // pattern. The window's last part, scanned only for what comes before it,
+  // is never kept.
+  const token = 'ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8'
+  const head = `PRIVATE_KEY=${'k'.repeat(11_988)}\n`
+  let leaked = 0
+  for (let at = 23_900; at <= 24_200; at += 1) {
+    const text = head + 'a'.repeat(at - head.length) + ' ' + token + ' tail'
+    const out = JSON.stringify(sanitize({ result: text }, limitsFor(16384), newStats()))
+    if (out.includes(token.slice(0, 8))) leaked += 1
+  }
+  expect(leaked).toBe(0)
+  const shortHead = `PRIVATE_KEY=${'k'.repeat(8_488)}\n`
+  let diagnosticLeaks = 0
+  for (let at = 9_150; at <= 9_200; at += 1) {
+    const text = shortHead + 'e'.repeat(at - shortHead.length) + ' ' + token + ' and more'
+    if (redactDiagnostic(text, 1000).includes(token.slice(0, 8))) diagnosticLeaks += 1
+  }
+  expect(diagnosticLeaks).toBe(0)
+})
+
+test('a credential name right after a non-credential option is still matched', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    ['kubectl create secret generic db --from-literal=password=S3cretValue1', 'kubectl create secret generic db --from-literal=password=[REDACTED]'],
+    ['gcloud run deploy svc --set-env-vars=DB_PASSWORD=hunter2value', 'gcloud run deploy svc --set-env-vars=DB_PASSWORD=[REDACTED]'],
+    ['gcloud run deploy svc --update-env-vars=API_KEY=abc123def --region us', 'gcloud run deploy svc --update-env-vars=API_KEY=[REDACTED]'],
+    ['docker run --env=PASSWORD=abc123def image', 'docker run --env=PASSWORD=[REDACTED]'],
+    ['docker build --build-arg=NPM_TOKEN=abc123def .', 'docker build --build-arg=NPM_TOKEN=[REDACTED]'],
+    ['terraform apply -var=db_password=abc123def', 'terraform apply -var=db_password=[REDACTED]'],
+    ['mvn deploy -Dserver=password=abc123def', 'mvn deploy -Dserver=password=[REDACTED]'],
+    ['curl --header=X-Api-Key:abc123def', 'curl --header=X-Api-Key:[REDACTED]'],
+    ['tool --opt= DB_PASSWORD=abc123def', 'tool --opt= DB_PASSWORD=[REDACTED]'],
+    ['env: DB_PASSWORD=abc123def', 'env: DB_PASSWORD=[REDACTED]'],
+  ]
+  for (const [input, want] of cases) expect(redactText(input, stats)).toBe(want)
+})
+
+test('a credential option loses its whole shell argument, whatever it holds', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    ['docker login --password "prefix\\"SecretSuffix" registry.example.com', 'docker login --password [REDACTED] registry.example.com'],
+    ['docker login --password \'prefix\'"SecretSuffix" registry.example.com', 'docker login --password [REDACTED] registry.example.com'],
+    ['docker login --password prefix\\ SecretSuffix registry.example.com', 'docker login --password [REDACTED] registry.example.com'],
+    ['docker login --password [REDACTED]SecretSuffix registry.example.com', 'docker login --password [REDACTED] registry.example.com'],
+    [`docker login --password ghp_${'A1b2'.repeat(9)}!SecretSuffix registry.example.com`, 'docker login --password [REDACTED] registry.example.com'],
+    ['curl --pass -SyntheticPassphrase file:///dev/null', 'curl --pass [REDACTED] file:///dev/null'],
+    ['tool --password "an unclosed quote\nSecretSuffix on the next line', 'tool --password [REDACTED]'],
+  ]
+  for (const [input, want] of cases) expect(redactText(input, stats)).toBe(want)
+  // Kept: an exact marker, and no value before the next long option.
+  expect(redactText('tool --token [REDACTED:github-token] --verbose', stats)).toBe('tool --token [REDACTED:github-token] --verbose')
+  expect(redactText('cli --password --verbose', stats)).toBe('cli --password --verbose')
+})
+
+test('flag credentials stay out of rows and diagnostics', () => {
+  const commands = [
+    'kubectl create secret generic db --from-literal=password=SecretSuffix1',
+    'docker login --password "prefix\\"SecretSuffix" registry.example.com',
+    'docker login --password [REDACTED]SecretSuffix registry.example.com',
+    'curl --pass -SecretSuffix file:///dev/null',
+  ]
+  for (const command of commands) {
+    const row = buildRow({ eventType: 'TOOL_STARTING', timestampMs: 0, eventId: 'e1', agent: 'coding-agent', sessionId: 's1',
+      invocationId: 'i1', userId: 'dev', traceId: null, spanId: null, parentSpanId: null,
+      content: { tool: 'Bash', args: { command } }, attributes: {}, maxPayloadChars: 16384 }).row
+    expect(JSON.stringify(row)).not.toContain('SecretSuffix')
+    expect(redactDiagnostic(`command failed: ${command}`, 1000)).not.toContain('SecretSuffix')
+  }
+})
+
+test("a credential option's value is found across line continuations; one an expansion holds, or a continuation splits or glues, runs to the end of the text", () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    ['docker login --username me --password \\\n    SecretSuffix registry.example.com', 'docker login --username me --password \\\n    [REDACTED] registry.example.com'],
+    ['cli --password \\\r\n  SecretSuffix tail', 'cli --password \\\r\n  [REDACTED] tail'],
+    // Glued to the name or split by a continuation: to the end of the text.
+    ['cli --password\\\nSecretSuffix --next', 'cli --password\\\n[REDACTED]'],
+    ['cli --password Secret\\\nSuffix tail', 'cli --password [REDACTED]'],
+    // An expansion's end is not read: to the end of the text.
+    ["docker login --password $'prefix\\' SecretSuffix' registry.example.com", 'docker login --password [REDACTED]'],
+    ['docker login --password $(printf %s SecretSuffix) registry.example.com', 'docker login --password [REDACTED]'],
+    ['docker login --password $(printf "%s )" SecretSuffix) registry.example.com', 'docker login --password [REDACTED]'],
+    ['docker login --password `printf %s SecretSuffix` registry.example.com', 'docker login --password [REDACTED]'],
+    ['docker login --password ${LOGIN:-my SecretSuffix} registry.example.com', 'docker login --password [REDACTED]'],
+    ['docker login --password "$(cat "my file") SecretSuffix" registry.example.com', 'docker login --password [REDACTED]'],
+    ['tool --password $(echo SecretSuffix', 'tool --password [REDACTED]'],
+  ]
+  for (const [input, want] of cases) expect(redactText(input, stats)).toBe(want)
+  // No value before the next option, across a continuation too.
+  expect(redactText('cli --password \\\n--verbose', stats)).toBe('cli --password \\\n--verbose')
+})
+
+test('continued and expanded flag credentials stay out of rows and diagnostics', () => {
+  // Each command, and whether what follows its value is kept.
+  const commands: [string, boolean][] = [
+    ['docker login --username me --password \\\n    SecretSuffix registry.example.com', true],
+    ["docker login --password $'prefix\\' SecretSuffix' registry.example.com", false],
+    ['docker login --password $(printf %s SecretSuffix) registry.example.com', false],
+    ['docker login --password `printf %s SecretSuffix` registry.example.com', false],
+  ]
+  for (const [command, kept] of commands) {
+    const row = buildRow({ eventType: 'TOOL_STARTING', timestampMs: 0, eventId: 'e1', agent: 'coding-agent', sessionId: 's1',
+      invocationId: 'i1', userId: 'dev', traceId: null, spanId: null, parentSpanId: null,
+      content: { tool: 'Bash', args: { command } }, attributes: {}, maxPayloadChars: 16384 }).row
+    expect(JSON.stringify(row)).not.toContain('SecretSuffix')
+    expect(redactDiagnostic(`command failed: ${command}`, 1000)).not.toContain('SecretSuffix')
+    expect(JSON.stringify(row).includes('registry.example.com')).toBe(kept)
+  }
+})
+
+test('a value a substitution holds runs to the end of the text, whatever shell code is in it', () => {
+  const stats = newStats()
+  // The substitution's end is not read (its comments, here-documents, arrays
+  // and case statements included), so whatever follows the value goes too.
+  const inputs = [
+    'cli --password $(printf %s SecretSuffix # comment\n) --verbose\necho ordinary',
+    'cli --password $(printf %s prefix # )\nprintf %s SecretSuffix) --verbose\necho ordinary',
+    'cli --password $(printf %s SecretSuffix # (\n) --verbose',
+    'cli --password $(printf %s prefix \\\n# )\nprintf %s SecretSuffix) --verbose',
+    'cli --password $(# a comment first\nprintf %s SecretSuffix) --verbose',
+    'cli --password <(printf %s x # )\nprintf %s SecretSuffix) --verbose',
+    'cli --password $(printf %s abc#SecretSuffix) --verbose',
+    'cli --password $(printf %s $((1 << 2)) SecretSuffix) --verbose',
+    'cli --password $( (( x = 1 << 2 )); printf %s SecretSuffix) --verbose',
+    'cli --password $(printf %s ${#SecretSuffix}) --verbose',
+    'cli --password $(printf "%s # )" SecretSuffix) --verbose',
+    'cli --password $(printf %s \\\n  SecretSuffix) --verbose',
+    'cli --password $(cat <<< SecretSuffix) --verbose',
+    'cli --password $(printf %s showcase case SecretSuffix) --verbose',
+    'cli --password ${LOGIN:-{a b} SecretSuffix} --verbose',
+    'cli --password $(cat <<EOF\nSecretSuffix\nEOF\n) --verbose\necho ordinary',
+    'cli --password "$(cat <<EOF\n) " SecretSuffix\nEOF\n)" --verbose',
+    "cli --password $(cat <<-'END'\n\t) SecretSuffix\n\tEND\n) --verbose",
+    'cli --password $(cat <<A <<B\nx\nA\nSecretSuffix)\nB\n) --verbose',
+    'cli --password $(cat <<EOF\nA\nEOF\r\nSecretSuffix)\nEOF \n)\nEOF\n) --verbose',
+    'cli --password $(case x in x) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password $(case y in x) printf %s esac;; y) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password $(case a in (a) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password $(case "a b" in c | "a b") printf %s SecretSuffix;& d) printf %s x;; esac) --verbose',
+    'cli --password $(case a\nin\n  # a comment\n  a) printf %s SecretSuffix\n  ;;\nesac) --verbose',
+    'cli --password $(case a in a) printf %s SecretSuffix esac\nesac) --verbose',
+    'cli --password $(case a in a) cat <<EOF;;\nSecretSuffix)\nEOF\nesac) --verbose',
+    'cli --password $(ca\\\nse a i\\\nn a) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password $(cat <<EOF\nEOF) SecretSuffix\nEOF\n) --verbose',
+    // An array's elements, with their comments.
+    'cli --password $(a=( # )\nx\n); printf %s SecretSuffix) --verbose\necho ordinary',
+    'cli --password $(a=(x # )\n); printf %s SecretSuffix) --verbose',
+    'cli --password $(a=(y); a+=( # )\nx\n); printf %s SecretSuffix) --verbose',
+    'cli --password $(declare -a a=( # )\nx\n); printf %s SecretSuffix) --verbose',
+    'cli --password $(a=( [1]=x # )\n); printf %s SecretSuffix) --verbose',
+    'cli --password $(a=\\\n( # )\nx\n); printf %s SecretSuffix) --verbose',
+    'cli --password $(a=( (x) "#)" ); printf %s SecretSuffix) --verbose',
+    // A redirection names a file, never `esac`.
+    'cli --password $(case y in (x) <esac;; y) printf %s SecretSuffix;; esac) --verbose\necho ordinary',
+    'cli --password $(case y in (x) cat <esac;; y) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password $(case y in (x) >/dev/null esac;; y) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password $(case y in (x) >|esac;; y) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password $(case y in x) 2>&esac;; y) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password "$(cat <<EOF\ntext\\\nEOF\n) " SecretSuffix\nEOF\n)" --verbose',
+    'cli --password $(printf %s A;#x )\nprintf %s SecretSuffix) --verbose',
+    'cli --password $(printf %s x >#)\nprintf %s SecretSuffix) --verbose',
+    'cli --password $(printf %s A # x \\\nprintf %s SecretSuffix) --verbose',
+    'cli --password $(cat <<EOF) --verbose\nSecretSuffix\nEOF',
+    "cli --password $(cat <<''\nSecretSuffix)\n\n) --verbose",
+    'cli --password $(cat <<EOF $(printf %s x\n)\nSecretSuffix\nEOF\n) --verbose',
+    'cli --password $(case $(uname) in *) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password $(case a { a) printf %s SecretSuffix;; }) --verbose',
+    'cli --password $(case a in @(a|b)) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password $((printf %s a) SecretSuffix) --verbose',
+    'cli --password $(cat <<EOF\nSecretSuffix with no end',
+    'cli --password $(cat <<EOF\nSecretSuffix\nEOF) --verbose',
+    'cli --password $(printf %s $((1 # ))\n)) SecretSuffix) --verbose',
+    'cli --password $(a=(# )\nx\n); printf %s SecretSuffix) --verbose',
+    'cli --password $(a=( x;# )\n); printf %s SecretSuffix) --verbose',
+  ]
+  for (const input of inputs) expect(redactText(input, stats)).toBe('cli --password [REDACTED]')
+})
+
+test('a value a line continuation splits runs to the end of the text, a split $\', ${, $(, << or case included', () => {
+  const stats = newStats()
+  const inputs = [
+    "cli --password $\\\n'prefix\\' SecretSuffix' --verbose",
+    'cli --password $\\\n{LOGIN:-my SecretSuffix} --verbose',
+    'cli --password $\\\r\n{LOGIN:-my SecretSuffix} --verbose',
+    'cli --password $\\\n(printf %s SecretSuffix) --verbose',
+    'cli --password <\\\n(printf %s SecretSuffix) --verbose',
+    'cli --password $(ca\\\nse y in y) printf %s SecretSuffix;; esac) --verbose',
+    'cli --password $(cat <\\\n<EOF\n) SecretSuffix\nEOF\n) --verbose',
+    'cli --password $(cat <<\\\n< SecretSuffix) --verbose',
+  ]
+  for (const input of inputs) expect(redactText(input, stats)).toBe('cli --password [REDACTED]')
+})
+
+test('a credential argument ends at an unquoted control or redirection operator', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    ['cli --password plain;printf done', 'cli --password [REDACTED];printf done'],
+    ['cli --password plain|printf done', 'cli --password [REDACTED]|printf done'],
+    ['cli --password plain&& printf done', 'cli --password [REDACTED]&& printf done'],
+    ['cli --password plain>out.txt', 'cli --password [REDACTED]>out.txt'],
+    ['(cli --password plain) && echo ok', '(cli --password [REDACTED]) && echo ok'],
+    // A process substitution's end is not read: to the end of the text.
+    ['cli --password <(printf %s SecretSuffix) --verbose', 'cli --password [REDACTED]'],
+    ['cli --password "a;b|c" --verbose', 'cli --password [REDACTED] --verbose'],
+    ['cli --password prefix\vSecret\fSuffix tail', 'cli --password [REDACTED] tail'],
+  ]
+  for (const [input, want] of cases) expect(redactText(input, stats)).toBe(want)
+})
+
+test('a name=value credential runs on across line continuations and an unclosed quote', () => {
+  const stats = newStats()
+  // A continuation in the value: to the end of the text.
+  expect(redactText('cli --password=\\\nSecretSuffix --verbose\nnext line', stats)).toBe('cli --password=[REDACTED]')
+  expect(redactText('cli --password="prefix\nSecretSuffix" --verbose\nnext line', stats)).toBe('cli --password=[REDACTED]\nnext line')
+  expect(redactText('PASSWORD=abc\\\r\ndefSecretSuffix\r\nnext', stats)).toBe('PASSWORD=[REDACTED]')
+  expect(redactText('{"password": "abc", "user": "bob"}\nnext', stats)).toBe('{"password": [REDACTED]\nnext')
+})
+
+test('a shell-style name=value runs through its whole shell word, to the end of the line it ends on', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    ['cli --password=prefix"Secret\nSuffix" --verbose\nnext line', 'cli --password=[REDACTED]\nnext line'],
+    ["cli --password=prefix'Secret\nSuffix' --verbose\nnext line", 'cli --password=[REDACTED]\nnext line'],
+    // An expansion, a backtick or an escaped quote: to the end of the text.
+    ['cli --password=$(printf %s prefix\nprintf %s SecretSuffix) --verbose\nnext line', 'cli --password=[REDACTED]'],
+    ['PASSWORD=$(cat <<EOF\nSecretSuffix\nEOF\n) cli --verbose', 'PASSWORD=[REDACTED]'],
+    ['cli --from-literal=password=`printf %s prefix\nprintf %s SecretSuffix` --verbose\nnext line', 'cli --from-literal=password=[REDACTED]'],
+    ['cli "--password=prefix\nSecretSuffix" --verbose\nnext line', 'cli "--password=[REDACTED]"\nnext line'],
+    ['cli `--password=prefix\nSecretSuffix` --verbose\nnext line', 'cli `--password=[REDACTED]'],
+    ['log {\\"cmd\\": \\"PASSWORD=abc\\"}\nnext line', 'log {\\"cmd\\": \\"PASSWORD=[REDACTED]'],
+  ]
+  for (const [input, want] of cases) {
+    expect(redactText(input, stats)).toBe(want)
+    expect(redactText(want, stats)).toBe(want)
+  }
+  // A name: value, or name = value with spaces (code, INI), keeps to its line
+  // unless the value opens with a quote.
+  expect(redactText("password: it's here\nnext line", stats)).toBe('password: [REDACTED]\nnext line')
+  expect(redactText('key = (hi << 8) | lo\nnext line', stats)).toBe('key = [REDACTED]\nnext line')
+  expect(redactText('token=abc def\nnext line', stats)).toBe('token=[REDACTED]\nnext line')
+})
+
+test('a query-style name= value that a quote or an expansion opens runs through its shell word', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    ['cmd;PASSWORD="a Secret" cli --verbose', 'cmd;PASSWORD=[REDACTED] cli --verbose'],
+    ["true&TOKEN='x Secret' cli", 'true&TOKEN=[REDACTED] cli'],
+    // An expansion's end is not read: to the end of the text.
+    ['cmd;API_KEY=$(printf %s a Secret) cli', 'cmd;API_KEY=[REDACTED]'],
+    ['cmd;TOKEN=`printf %s a Secret` cli', 'cmd;TOKEN=[REDACTED]'],
+    // Query strings keep their rule.
+    ['/path?token=abc&x=1 next', '/path?token=[REDACTED]&x=1 next'],
+    ['a=1&password=abc;b=2', 'a=1&password=[REDACTED];b=2'],
+  ]
+  for (const [input, want] of cases) {
+    expect(redactText(input, stats)).toBe(want)
+    expect(redactText(want, stats)).toBe(want)
+  }
+})
+
+test('a quote that closes around a credential name leaves the value outside it', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    ['cli "--password"="prefix\nSecretSuffix" --verbose\necho ordinary', 'cli "--password"=[REDACTED]\necho ordinary'],
+    ['cli --"password"="prefix\nSecretSuffix" --verbose\necho ordinary', 'cli --"password"=[REDACTED]\necho ordinary'],
+    ["cli --'password'='prefix\nSecretSuffix' --verbose\necho ordinary", "cli --'password'=[REDACTED]\necho ordinary"],
+    ['message "password"="prefix\nSecretSuffix" more\nnext line', 'message "password"=[REDACTED]\nnext line'],
+    // A quote opened between the name and `=` holds the value.
+    ['cli --password"=prefix\nSecretSuffix" --verbose\nnext line', 'cli --password"=[REDACTED]"\nnext line'],
+    // An option whose name is quoted alone, and its value.
+    ['cli "--password" "Secret Suffix" --verbose', 'cli "--password" [REDACTED] --verbose'],
+    ["cli '--password' Secret\\ Suffix --verbose", "cli '--password' [REDACTED] --verbose"],
+    // Empty and other complete quoted segments before the name: the quote
+    // just before it opens one.
+    [`cli ''"--password=prefix\nSecretSuffix" --verbose\necho ordinary`, `cli ''"--password=[REDACTED]"\necho ordinary`],
+    [`cli ""'--password=prefix\nSecretSuffix' --verbose\necho ordinary`, `cli ""'--password=[REDACTED]'\necho ordinary`],
+    [`cli ''''"--password=prefix\nSecretSuffix" --verbose\necho ordinary`, `cli ''''"--password=[REDACTED]"\necho ordinary`],
+    [`cli ''""'--password=prefix\nSecretSuffix' --verbose\necho ordinary`, `cli ''""'--password=[REDACTED]'\necho ordinary`],
+    [`cli 'a'"--password=prefix\nSecretSuffix" --verbose\necho ordinary`, `cli 'a'"--password=[REDACTED]"\necho ordinary`],
+    [`cli $'a'"--password=prefix\nSecretSuffix" --verbose\necho ordinary`, `cli $'a'"--password=[REDACTED]"\necho ordinary`],
+    // An escaped quote in the word: the quote the value starts in is not
+    // known, so it runs to the end of the text.
+    [`cli \\'"--password=prefix\nSecretSuffix" --verbose\necho ordinary`, `cli \\'"--password=[REDACTED]`],
+    [`cli ''"--password Secret\nSuffix" --verbose\necho ordinary`, `cli ''"--password [REDACTED]" --verbose\necho ordinary`],
+    [`echo "a\nb" "--password=prefix\nSecretSuffix" --verbose\necho ordinary`, `echo "a\nb" "--password=[REDACTED]"\necho ordinary`],
+  ]
+  for (const [input, want] of cases) {
+    expect(redactText(input, stats)).toBe(want)
+    expect(redactText(want, stats)).toBe(want)
+  }
+  // A quote that closes an earlier segment, which the word read alone takes
+  // for an opening one: the quote the value starts in is not known, so it
+  // runs to the end of the text.
+  expect(redactText(`cli "a b"--password=x"y z" --verbose\necho ordinary`, stats)).toBe(`cli "a b"--password=[REDACTED]`)
+})
+
+test('line continuations, quotes and backslashes inside an option name are read through', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    ['cli --pass\\\nword SecretSuffix --verbose', 'cli --pass\\\nword [REDACTED] --verbose'],
+    ['cli --pa\\\nss\\\nword SecretSuffix --verbose', 'cli --pa\\\nss\\\nword [REDACTED] --verbose'],
+    ['cli -\\\n-password SecretSuffix --verbose', 'cli -\\\n-password [REDACTED] --verbose'],
+    ['cli --\\\npassword SecretSuffix --verbose', 'cli --\\\npassword [REDACTED] --verbose'],
+    ['cli --pass\\\r\nword SecretSuffix --verbose', 'cli --pass\\\r\nword [REDACTED] --verbose'],
+    // A continuation with no space beside it right after a credential's name
+    // glues what follows to it: `word=…` after `--pass`, and `=…` after
+    // `--password`, go to the end of the text.
+    ['cli --pass\\\nword=SecretSuffix --verbose\nnext', 'cli --pass\\\n[REDACTED]'],
+    ['cli --password\\\n=SecretSuffix --verbose\nnext', 'cli --password\\\n[REDACTED]'],
+    ['PASS\\\nWORD=SecretSuffix cli\nnext', 'PASS\\\nWORD=[REDACTED]\nnext'],
+    // Quotes and backslashes the shell removes from a name.
+    ['cli "--pass"word SecretSuffix --verbose', 'cli "--pass"word [REDACTED] --verbose'],
+    ['cli --pass""word SecretSuffix --verbose', 'cli --pass""word [REDACTED] --verbose'],
+    ['cli --pa\\ssword SecretSuffix --verbose', 'cli --pa\\ssword [REDACTED] --verbose'],
+    ['cli -\\-password SecretSuffix --verbose', 'cli -\\-password [REDACTED] --verbose'],
+    ['cli "-"-password SecretSuffix --verbose', 'cli "-"-password [REDACTED] --verbose'],
+    ["cli $'--pass'word SecretSuffix --verbose", "cli $'--pass'word [REDACTED] --verbose"],
+    ["cli --'pass'word=SecretSuffix --verbose\nnext", "cli --'pass'word=[REDACTED]\nnext"],
+    ['cli "--api"-key=SecretSuffix --verbose\nnext', 'cli "--api"-key=[REDACTED]\nnext'],
+    ['cli "--api"-key SecretSuffix --verbose\nnext', 'cli "--api"-key [REDACTED] --verbose\nnext'],
+    // ANSI-C escapes in the name, and an `=` inside a quote.
+    ["cli $'--pa\\x73sword' SecretSuffix --verbose", "cli $'--pa\\x73sword' [REDACTED] --verbose"],
+    ["cli $'--pa\\163sword' SecretSuffix --verbose", "cli $'--pa\\163sword' [REDACTED] --verbose"],
+    ['cli "--pass"word"=prefix\nSecretSuffix" --verbose\nnext', 'cli "--pass"word"=[REDACTED]"\nnext'],
+    // So does a value glued by such a continuation (`--password\` and
+    // `VALUE`), unless what follows carries the name on.
+    ['cli --password\\\nSecretSuffix host', 'cli --password\\\n[REDACTED]'],
+    ['cli --pass\\\nword\\\nSecretSuffix host', 'cli --pass\\\nword\\\n[REDACTED]'],
+    ['cli "--password"\\\n-stdin host', 'cli "--password"\\\n-stdin host'],
+    ['cli --password\\\n-stdin host', 'cli --password\\\n-stdin host'],
+    // Not an option: kept.
+    ['cli "--pass"word-stdin host', 'cli "--pass"word-stdin host'],
+    ['cli "--max"-tokens 1024', 'cli "--max"-tokens 1024'],
+  ]
+  for (const [input, want] of cases) {
+    expect(redactText(input, stats)).toBe(want)
+    expect(redactText(want, stats)).toBe(want)
+  }
+})
+
+test('a value is read in the quote it starts in where the whole-text scan and the word alone agree on it, and otherwise runs to the end of the text', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    // Prose or an odd quote before it: the scan and the word alone disagree
+    // on the quote the value starts in, so it runs to the end of the text.
+    [`It's set up. Run: cli '--password Secret Suffix' --verbose`, `It's set up. Run: cli '--password [REDACTED]`],
+    [`It's set up.\ncli '--password Secret\nSuffix' --verbose\necho ordinary`, `It's set up.\ncli '--password [REDACTED]`],
+    [`It's set up. Run: cli $'--password Secret Suffix' --verbose`, `It's set up. Run: cli $'--password [REDACTED]`],
+    [`Use a 27" screen; cli "--password Secret Suffix" --verbose`, `Use a 27" screen; cli "--password [REDACTED]`],
+    // Read as shell, the text is in a quote from `Don't` on: to its end.
+    [`Don't: cli "--password Secret Suffix" --verbose`, `Don't: cli "--password [REDACTED]`],
+    // A comment is read on its own.
+    [`# example: cli "--password Secret Suffix" --verbose`, `# example: cli "--password [REDACTED]" --verbose`],
+    // Comments and words the scan reads as the shells do.
+    [`echo \\\n# "\nenv "PASSWORD=prefix\nSecretSuffix" printenv PASSWORD\necho ordinary`, `echo \\\n# "\nenv "PASSWORD=[REDACTED]"\necho ordinary`],
+    [`echo \\\n# '\nenv 'PASSWORD=prefix\nSecretSuffix' printenv PASSWORD\necho ordinary`, `echo \\\n# '\nenv 'PASSWORD=[REDACTED]'\necho ordinary`],
+    [`cli --verbose \\\n# don't log\ncli '--password Secret Suffix' --verbose`, `cli --verbose \\\n# don't log\ncli '--password [REDACTED]' --verbose`],
+    [`x=a; cli \${x}#'q\nr' '--password Secret Suffix' --verbose`, `x=a; cli \${x}#'q\nr' '--password [REDACTED]' --verbose`],
+    // Past a here-document's or an arithmetic `<<` the quote is not known: to
+    // the end of the text. A case statement is plain text to the scan.
+    [`cat <<EOF\nharmless\nEOF\nenv "DB_"PASSWORD="prefix\nSecretSuffix" printenv DB_PASSWORD\necho ordinary`, `cat <<EOF\nharmless\nEOF\nenv "DB_"PASSWORD=[REDACTED]`],
+    [`cat <<EOF\nharmless\nEOF\nenv 'DB_'PASSWORD='prefix\nSecretSuffix' printenv DB_PASSWORD\necho ordinary`, `cat <<EOF\nharmless\nEOF\nenv 'DB_'PASSWORD=[REDACTED]`],
+    [`case x in x) ;; esac\nenv "DB_"PASSWORD="prefix\nSecretSuffix" printenv DB_PASSWORD\necho ordinary`, `case x in x) ;; esac\nenv "DB_"PASSWORD=[REDACTED]\necho ordinary`],
+    [`echo case x in\nenv "DB_"PASSWORD="prefix\nSecretSuffix" printenv DB_PASSWORD\necho ordinary`, `echo case x in\nenv "DB_"PASSWORD=[REDACTED]\necho ordinary`],
+    [`echo $((1 << 2))\nenv "DB_"PASSWORD="prefix\nSecretSuffix" printenv DB_PASSWORD\necho ordinary`, `echo $((1 << 2))\nenv "DB_"PASSWORD=[REDACTED]`],
+    [`cli -D"javax.net.ssl."trustStorePassword="prefix\nSecretSuffix" --verbose\necho ordinary`, `cli -D"javax.net.ssl."trustStorePassword=[REDACTED]\necho ordinary`],
+    [`cli -D'javax.net.ssl.'trustStorePassword='prefix\nSecretSuffix' --verbose\necho ordinary`, `cli -D'javax.net.ssl.'trustStorePassword=[REDACTED]\necho ordinary`],
+    // In a command string another shell runs, the scan and the word alone
+    // disagree: to the end of the text.
+    [`sh -c "printf '<%s>' --batch --passphrase \\"correct horse battery staple\\" -d file"`, `sh -c "printf '<%s>' --batch --passphrase [REDACTED]`],
+    [`sh -c "printf '<%s>' --passphrase correct\\\\ horse\\\\ battery"`, `sh -c "printf '<%s>' --passphrase [REDACTED]`],
+    [`ssh host "cli --password=\\"Secret\nSuffix\\" --verbose"\necho ordinary`, `ssh host "cli --password=[REDACTED]`],
+    [`ssh host "cli --password \\"two words\\" --verbose"`, `ssh host "cli --password [REDACTED]`],
+    [`sh -c 'cli --password "two words" --verbose'`, `sh -c 'cli --password [REDACTED]`],
+    [`docker exec app sh -c "cli --api-key \\"a b\\" run"`, `docker exec app sh -c "cli --api-key [REDACTED]`],
+  ]
+  for (const [input, want] of cases) {
+    expect(redactText(input, stats)).toBe(want)
+    expect(redactText(want, stats)).not.toContain('Suffix')
+  }
+  // After a here-document, a quote that closes an earlier segment: past a
+  // `<<` the quote is not known, so the value runs to the end of the text.
+  expect(redactText(`cat <<EOF\nx\nEOF\ncli "a b"--password=x"y\nSecretSuffix" --verbose\necho ordinary`, stats))
+    .toBe(`cat <<EOF\nx\nEOF\ncli "a b"--password=[REDACTED]`)
+})
+
+test('where the scan and the word alone disagree on the quote a value starts in, or the scan cannot read the text before it, the value runs to the end of the text', () => {
+  const stats = newStats()
+  const token = `ghp_${'0'.repeat(36)}`
+  const cases: [string, string][] = [
+    // Prose with an odd quote before a value quoted the ordinary way: to the
+    // end of the text.
+    [`It's set up. Run: cli --password 'Secret Suffix' --verbose`, `It's set up. Run: cli --password [REDACTED]`],
+    [`Use a 27" screen; cli --password "Secret Suffix" --verbose`, `Use a 27" screen; cli --password [REDACTED]`],
+    [`Here's the command:\n\`\`\`\ncli --password 'Secret Suffix'\n\`\`\``, `Here's the command:\n\`\`\`\ncli --password [REDACTED]`],
+    [`error: can't connect; retry with --password 'Secret Suffix'`, `error: can't connect; retry with --password [REDACTED]`],
+    [`It's set up. Run: cli --passphrase "it's my Suffix phrase" --verbose`, `It's set up. Run: cli --passphrase [REDACTED]`],
+    [`It's set up: export DB_PASSWORD='Secret\nSuffix'\necho ordinary`, `It's set up: export DB_PASSWORD=[REDACTED]`],
+    [`It's set up: cli --password='Secret\nSuffix' --verbose\necho ordinary`, `It's set up: cli --password=[REDACTED]`],
+    [`Use a 27" screen; cli -Dssl.password="Secret\nSuffix" --verbose\necho ordinary`, `Use a 27" screen; cli -Dssl.password=[REDACTED]`],
+    [`It's here: cli "--pass"word 'Secret Suffix' --verbose`, `It's here: cli "--pass"word [REDACTED]`],
+    [`x=\nprintf '<%s>' "\${x:-it's}"; printf '<%s>' --password 'Secret Suffix' --verbose`, `x=\nprintf '<%s>' "\${x:-it's}"; printf '<%s>' --password [REDACTED] --verbose`],
+    // Their mirrors: read as shell, the text is in a quote to its end.
+    [`Don't: cli --password "Secret Suffix" --verbose`, `Don't: cli --password [REDACTED]`],
+    [`Use a 27" screen; cli --password 'Secret Suffix' --verbose`, `Use a 27" screen; cli --password [REDACTED]`],
+    // An option quoted by escaped quotes in a command string.
+    [`sh -c "cli \\"--password\\" \\"Secret Suffix\\" --verbose"`, `sh -c "cli \\"--password\\" [REDACTED]`],
+    [`ssh host "mysql \\"--password\\" \\"Secret Suffix\\" -e status"`, `ssh host "mysql \\"--password\\" [REDACTED]`],
+    [`sh -c "cli \\"--password\\" Secret\\\\ Suffix --verbose"`, `sh -c "cli \\"--password\\" [REDACTED]`],
+    [`sh -c "cli \\"--pass\\"word \\"Secret Suffix\\" --verbose"`, `sh -c "cli \\"--pass\\"word [REDACTED]`],
+    // After a comment ending in a backslash, or any `<<` but `<<<`: to the end
+    // of the text.
+    [`# see C:\\path\\\nsh -c "printf \\"<%s>\\" --password \\"a Suffix\\"; echo"`, `# see C:\\path\\\nsh -c "printf \\"<%s>\\" --password [REDACTED]`],
+    [`int main() { std::cout << x; }\nsh -c "cli --password \\"a Suffix\\" run"`, `int main() { std::cout << x; }\nsh -c "cli --password [REDACTED]`],
+    [`y = 1 << 4\nssh host "cli --api-key \\"a Suffix\\" run"`, `y = 1 << 4\nssh host "cli --api-key [REDACTED]`],
+    // A marker followed by a quote does not cut a longer reading short.
+    [`case $(printf a) in a) :;; esac\ncli --password ${token}" ' SecretSuffix" --verbose`, `case $(printf a) in a) :;; esac\ncli --password [REDACTED] --verbose`],
+    [`case $(printf a) in a) :;; esac\ncli --password ${token}' " SecretSuffix' --verbose`, `case $(printf a) in a) :;; esac\ncli --password [REDACTED] --verbose`],
+    [`case $(printf a) in a) :;; esac\ncli --password [REDACTED]" ' SecretSuffix" --verbose`, `case $(printf a) in a) :;; esac\ncli --password [REDACTED] --verbose`],
+    // A command string in a here-document's body or a comment.
+    [`sh <<'EOF'\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\""\nEOF\necho ordinary`, `sh <<'EOF'\nsh -c "printf '<%s>\\n' --password [REDACTED]`],
+    [`sh <<EOF\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\""\nEOF\necho ordinary`, `sh <<EOF\nsh -c "printf '<%s>\\n' --password [REDACTED]`],
+    [`# sh -c "cli --password \\"Secret Suffix\\""\necho ordinary`, `# sh -c "cli --password [REDACTED]`],
+    // A shell assignment right after `;` or `&`: its whole shell word; one an
+    // expansion holds, to the end of the text.
+    [`:;PASSWORD=correct\\ horse\\ SecretSuffix printenv PASSWORD`, `:;PASSWORD=[REDACTED] printenv PASSWORD`],
+    [`:;PASSWORD=prefix"Secret\nSuffix" printenv PASSWORD`, `:;PASSWORD=[REDACTED] printenv PASSWORD`],
+    [`:;PASSWORD=prefix$(printf "Secret\\nSuffix") printenv PASSWORD`, `:;PASSWORD=[REDACTED]`],
+    [`true&PASSWORD=correct\\ horse\\ SecretSuffix printenv PASSWORD`, `true&PASSWORD=[REDACTED] printenv PASSWORD`],
+    // Prose, Markdown and other code before a quoted value; a marker before
+    // the rest of a value; comments, here-document bodies and prose that
+    // hold a command string.
+    [`I'm stuck. Please run: mysql -u admin --password 'correct horse battery Suffix' -h db.internal app`, `I'm stuck. Please run: mysql -u admin --password [REDACTED]`],
+    [`Here's the fix:\n\`\`\`\nPGPASSWORD='correct horse\nbattery Suffix' psql -h db app\n\`\`\``, `Here's the fix:\n\`\`\`\nPGPASSWORD=[REDACTED]`],
+    [`It's set up. Run: cli --password $'Secret Suffix' --verbose`, `It's set up. Run: cli --password [REDACTED]`],
+    [`It's set up. Run: cli --password "$(printf %s 'Secret Suffix')" --verbose`, `It's set up. Run: cli --password [REDACTED]`],
+    [`fn f(x: &'static str) {}\ncli --password 'Secret Suffix' --verbose`, `fn f(x: &'static str) {}\ncli --password [REDACTED]`],
+    [`Use the \` key; cli --password 'Secret Suffix' --verbose`, `Use the \` key; cli --password [REDACTED]`],
+    [`It's set up. Run: cli $'--pa\\x73sword' 'Secret Suffix' --verbose`, `It's set up. Run: cli $'--pa\\x73sword' [REDACTED]`],
+    [`echo "\${x:-it's}"\ncli --password 'Secret Suffix' --verbose`, `echo "\${x:-it's}"\ncli --password [REDACTED] --verbose`],
+    [`cli "a b"--password=[REDACTED]"Secret\nSuffix" --verbose`, `cli "a b"--password=[REDACTED]`],
+    [`env "DB_\\\n"PASSWORD=[REDACTED]"Secret\nSuffix" printenv DB_PASSWORD\necho ordinary`, `env "DB_\\\n"PASSWORD=[REDACTED]`],
+    [`# note \\\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\" --verbose"\necho ordinary`, `# note \\\nsh -c "printf '<%s>\\n' --password [REDACTED]`],
+    [`cat <<EOF\nline one \\\ncontinued\nEOF\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\" --verbose"\necho ordinary`, `cat <<EOF\nline one \\\ncontinued\nEOF\nsh -c "printf '<%s>\\n' --password [REDACTED]`],
+    [`echo x # comment\\\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\" --verbose"\necho ordinary`, `echo x # comment\\\nsh -c "printf '<%s>\\n' --password [REDACTED]`],
+    [`case x in\na) :;; # arm\\\nb) :;;\nesac\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\" --verbose"\necho ordinary`, `case x in\na) :;; # arm\\\nb) :;;\nesac\nsh -c "printf '<%s>\\n' --password [REDACTED]`],
+    [`cat > deploy.sh <<'EOF'\n#!/bin/sh\nssh prod "mysql --password \\"correct horse battery Suffix\\" -e 'select 1'"\nEOF\nchmod +x deploy.sh`, `cat > deploy.sh <<'EOF'\n#!/bin/sh\nssh prod "mysql --password [REDACTED]`],
+    [`# usage: sh -c "cli --passphrase \\"correct horse Suffix\\" -d f"`, `# usage: sh -c "cli --passphrase [REDACTED]`],
+    [`See issue #42: ssh host "deploy --password \\"pass Suffix\\" now"`, `See issue #42: ssh host "deploy --password [REDACTED]`],
+    [`cat <<EOF\nssh host "deploy --password \\"pass Suffix\\" now"\nEOFX\nmore`, `cat <<EOF\nssh host "deploy --password [REDACTED]`],
+    [`# cli --password 'Secret Suffix' \\\necho ordinary`, `# cli --password [REDACTED] \\\necho ordinary`],
+    [`cat <<EOF\nmysql --password 'Secret Suffix' -h db \\\nmore\nEOF\necho ordinary`, `cat <<EOF\nmysql --password [REDACTED]`],
+  ]
+  for (const [input, want] of cases) {
+    expect(redactText(input, stats)).toBe(want)
+    expect(redactText(want, stats)).not.toContain('Suffix')
+  }
+  // Query strings keep their rule.
+  expect(redactText('/path?token=abc&x=1 next', stats)).toBe('/path?token=[REDACTED]&x=1 next')
+})
+
+test('a value in a command string another shell runs, or after an escape its quoting leaves in, runs to the end of the text', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    [`Use a 27" screen; sh -c "cli \\"--password Secret Suffix\\" run"\necho ordinary`, `Use a 27" screen; sh -c "cli \\"--password [REDACTED]`],
+    [`Use a 27" screen; sh -c "cli --password \\"Secret Suffix\\" run"\necho ordinary`, `Use a 27" screen; sh -c "cli --password [REDACTED]`],
+    [`Use a 27" screen; sh -c "cli --password \\"Secret Suffix\\" run`, `Use a 27" screen; sh -c "cli --password [REDACTED]`],
+    [`Use a 27" screen; sh -c "cli --password pre\\"Secret Suffix\\" run`, `Use a 27" screen; sh -c "cli --password [REDACTED]`],
+    [`Use a 27" screen; sh -c "cli --password Secret\\\\ Suffix run"`, `Use a 27" screen; sh -c "cli --password [REDACTED]`],
+    [`Use a 27" screen; sh -c "cli \\"--pass\\"word \\"Secret Suffix\\" run"`, `Use a 27" screen; sh -c "cli \\"--pass\\"word [REDACTED]`],
+    [`a "b\nsh -c "cli \\"--password=Secret\nSuffix\\" run"\necho ordinary`, `a "b\nsh -c "cli \\"--password=[REDACTED]`],
+    [`Use a 27" screen; ssh host "env \\"PASSWORD=Secret Suffix\\" printenv"\necho ordinary`, `Use a 27" screen; ssh host "env \\"PASSWORD=[REDACTED]`],
+    [`log {\\"cmd\\": \\"PASSWORD=abc\\"}\nnext line`, `log {\\"cmd\\": \\"PASSWORD=[REDACTED]`],
+    [`cli \\"--password abc\\" --verbose`, `cli \\"--password [REDACTED]`],
+  ]
+  for (const [input, want] of cases) {
+    expect(redactText(input, stats)).toBe(want)
+    expect(redactText(want, stats)).not.toContain('Suffix')
+  }
+})
+
+test('a word is read whole across quotes, backslashes and line continuations', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    // A continuation with no space beside it right after a credential's name
+    // glues what follows to it: to the end of the text.
+    [`cli "--pass\\\n"word SecretSuffix --verbose\necho ordinary`, `cli "--pass\\\n[REDACTED]`],
+    [`cli --pass\\\n"word" SecretSuffix --verbose\necho ordinary`, `cli --pass\\\n[REDACTED]`],
+    [`cli --pass\\\n'word' SecretSuffix --verbose\necho ordinary`, `cli --pass\\\n[REDACTED]`],
+    [`cli "--pass\\\r\n"word SecretSuffix --verbose\r\necho ordinary`, `cli "--pass\\\r\n[REDACTED]`],
+    [`cli --pass\\\r\n"word" SecretSuffix --verbose\r\necho ordinary`, `cli --pass\\\r\n[REDACTED]`],
+    [`cli --password\\\n"SecretSuffix" host\necho ordinary`, `cli --password\\\n[REDACTED]`],
+    // Unless it carries the name on: the longer name's value.
+    [`cli --api\\\n"-key" SecretSuffix --verbose\necho ordinary`, `cli --api\\\n"-key" [REDACTED] --verbose\necho ordinary`],
+    [`env "DB_PASS"WORD=SecretSuffix printenv DB_PASSWORD\necho ordinary`, `env "DB_PASS"WORD=[REDACTED]\necho ordinary`],
+    [`env DB_PASS"WORD"=SecretSuffix printenv DB_PASSWORD\necho ordinary`, `env DB_PASS"WORD"=[REDACTED]\necho ordinary`],
+    [`env 'DB_PASS'WORD='Secret\nSuffix' printenv DB_PASSWORD\necho ordinary`, `env 'DB_PASS'WORD=[REDACTED]\necho ordinary`],
+    [`env DB_PA\\SSWORD=SecretSuffix printenv DB_PASSWORD\necho ordinary`, `env DB_PA\\SSWORD=[REDACTED]\necho ordinary`],
+    [`env "DB_PASS\\\n"WORD=SecretSuffix printenv DB_PASSWORD\necho ordinary`, `env "DB_PASS\\\n"WORD=[REDACTED]\necho ordinary`],
+    [`cli -Dssl.pass"word"=SecretSuffix --verbose\necho ordinary`, `cli -Dssl.pass"word"=[REDACTED]\necho ordinary`],
+  ]
+  for (const [input, want] of cases) {
+    expect(redactText(input, stats)).toBe(want)
+    expect(redactText(want, stats)).not.toContain('Suffix')
+  }
+  // A longer word that names no credential keeps what follows it.
+  for (const text of ['cli --password\\\n"-stdin" host\necho ordinary', "cli --password\\\n'-stdin' host", 'cli --password\\\n"_file" path', 'cli "--password"\\\n-stdin host']) {
+    expect(redactText(text, stats)).toBe(text)
+  }
+})
+
+test('a credential option inside a quote that opens just before it loses everything to that quote\'s end', () => {
+  const stats = newStats()
+  const cases: [string, string][] = [
+    ['cli "--password Secret\nSuffix" --verbose', 'cli "--password [REDACTED]" --verbose'],
+    ["cli '--password Secret Suffix' --verbose", "cli '--password [REDACTED]' --verbose"],
+    ['cli "--password Secret" --verbose', 'cli "--password [REDACTED]" --verbose'],
+    // Where that quote closes with more of the word joined after it, or an
+    // escaped quote opens it, the value runs to the end of the text.
+    ['cli "--password Secret"Suffix --verbose', 'cli "--password [REDACTED]'],
+    ['cli \\"--password Secret\\" --verbose', 'cli \\"--password [REDACTED]'],
+  ]
+  for (const [input, want] of cases) {
+    expect(redactText(input, stats)).toBe(want)
+    expect(redactText(want, stats)).toBe(want)
+  }
+})
+
+test('option shapes by credential names: no value is kept (198 inputs)', () => {
+  const names = ['password', 'DB_PASSWORD', 'API_KEY', 'apiKey', 'token', 'NPM_TOKEN', 'client_secret', 'secret', 'passphrase', 'auth_token', 'private_key']
+  const shapes = ['--opt=@N=@V', '--opt=@N:@V', '--opt= @N=@V', '--opt:@N=@V', '-o=@N=@V', '-Dfoo=@N=@V', '@N=@V', 'export @N=@V', '--@N=@V',
+    '-@N=@V', '--@N @V', '@N: @V', '"@N": "@V"', 'https://x.example/?@N=@V&y=1', 'env: @N=@V', '--opt @N=@V', '-e @N=@V', '{"@N":"@V"}']
+  const secret = 'Zq9SecretVal'
+  const kept: string[] = []
+  for (const shape of shapes) {
+    for (const name of names) {
+      const input = `cmd ${shape.replace('@N', name).replace('@V', secret)} tail`
+      if (redactText(input, newStats()).includes(secret)) kept.push(input)
+    }
+  }
+  expect(shapes.length * names.length).toBe(198)
+  expect(kept).toEqual([])
+})
+
+// The texts a command reaches, in order: its redaction, the row's content
+// and error message, the insertAll request, a dead-letter file and the lines
+// read back from it, a diagnostic, and a second redaction pass (last).
+function pathsOf(command: string): string[] {
+  const { row } = buildRow({ eventType: 'TOOL_COMPLETED', timestampMs: 0, eventId: 'e1', agent: 'coding-agent', sessionId: 's1',
+    invocationId: 'i1', userId: 'dev', traceId: null, spanId: null, parentSpanId: null,
+    content: { tool: 'Bash', args: { command } }, attributes: {}, status: 'ERROR', errorMessage: `command failed: ${command}`,
+    maxPayloadChars: 16384 })
+  const [file = ''] = encodeLines([{ v: 1, kind: 'retry', reason: 'r', attempts: 1, failed_at: 'f', table: 't', row }])
+  const once = redactText(command, newStats())
+  return [once, JSON.stringify(row.content), row.error_message ?? '', insertAllBody([row]), file, JSON.stringify(parseFile(file).lines),
+    redactDiagnostic(`command failed: ${command}`, 1000), redactText(once, newStats())]
+}
+
+test('substitution-held credentials stay out of rows, errors, requests, dead letters and diagnostics', () => {
+  // Each command, and the text after its value that is kept.
+  const commands: [string, string[]][] = [
+    ['cli --password $(printf %s SecretSuffix # comment\n) --verbose\necho ordinary', []],
+    ['cli --password $(printf %s prefix \\\n# )\nprintf %s SecretSuffix) --verbose', []],
+    ['cli --password $(case y in x) printf %s esac;; y) printf %s SecretSuffix;; esac) --verbose', []],
+    ['cli --password $(cat <<EOF\nSecretSuffix\nEOF\n) --verbose\necho ordinary', []],
+    ['cli --password "$(cat <<EOF\n) " SecretSuffix\nEOF\n)" --verbose', []],
+    ['cli --password $(printf %s abc#SecretSuffix) --verbose', []],
+    ['cli --password $(printf %s $((1 << 2)) SecretSuffix) --verbose', []],
+    ['cli --password $(ca\\\nse a in a) printf %s SecretSuffix;; esac) --verbose', []],
+    ["cli --password $\\\n'prefix\\' SecretSuffix' --verbose", []],
+    ['cli --password $\\\n{LOGIN:-my SecretSuffix} --verbose', []],
+    ['cli --password $(cat <<< SecretSuffix) --verbose', []],
+    ['cli "--password Secret\nSuffix" --verbose', ['--verbose']],
+    ['cli "--password" "Secret Suffix" --verbose', ['--verbose']],
+    ['cli "--password"="prefix\nSecretSuffix" --verbose\necho ordinary', ['echo ordinary']],
+    ['cli --"password"="prefix\nSecretSuffix" --verbose\necho ordinary', ['echo ordinary']],
+    ["cli --'password'='prefix\nSecretSuffix' --verbose\necho ordinary", ['echo ordinary']],
+    ['message "password"="prefix\nSecretSuffix" more\necho ordinary', ['echo ordinary']],
+    ['cli --password=prefix"Secret\nSuffix" --verbose\necho ordinary', ['echo ordinary']],
+    ['cli --password=$(printf %s prefix\nprintf %s SecretSuffix) --verbose\necho ordinary', []],
+    ['PASSWORD=$(cat <<EOF\nSecretSuffix\nEOF\n) cli --verbose\necho ordinary', []],
+    ['cli --password $(a=( # )\nx\n); printf %s SecretSuffix) --verbose\necho ordinary', []],
+    ['cli --password=$(a=( # )\nx\n)\nprintf %s SecretSuffix) --verbose\necho ordinary', []],
+    ['cli --password prefix$(a=( # )\nx\n); printf %s SecretSuffix)suffix --verbose\necho ordinary', []],
+    ['cli --password $(case y in (x) <esac;; y) printf %s SecretSuffix;; esac) --verbose\necho ordinary', []],
+    ['cli --pass\\\nword SecretSuffix --verbose\necho ordinary', ['--verbose', 'echo ordinary']],
+    ['cli --pass\\\nword=SecretSuffix --verbose\necho ordinary', []],
+    ['cli "--pass"word SecretSuffix --verbose\necho ordinary', ['--verbose', 'echo ordinary']],
+    ["cli --'pass'word=SecretSuffix --verbose\necho ordinary", ['echo ordinary']],
+    [`cli ''"--password=prefix\nSecretSuffix" --verbose\necho ordinary`, ['echo ordinary']],
+    [`cli ""'--password=prefix\nSecretSuffix' --verbose\necho ordinary`, ['echo ordinary']],
+    [`cli ''''"--password Secret\nSuffix" --verbose\necho ordinary`, ['--verbose', 'echo ordinary']],
+    ["cli $'--pa\\x73sword' SecretSuffix --verbose\necho ordinary", ['--verbose', 'echo ordinary']],
+    ['cli "--pass"word"=prefix\nSecretSuffix" --verbose\necho ordinary', ['echo ordinary']],
+    ['cli --password\\\nSecretSuffix host\necho ordinary', []],
+    [`It's set up.\ncli '--password Secret\nSuffix' --verbose\necho ordinary`, []],
+    [`echo \\\n# "\nenv "PASSWORD=prefix\nSecretSuffix" printenv PASSWORD\necho ordinary`, ['echo ordinary']],
+    [`cat <<EOF\nharmless\nEOF\nenv "DB_"PASSWORD="prefix\nSecretSuffix" printenv DB_PASSWORD\necho ordinary`, []],
+    [`sh -c "printf '<%s>' --batch --passphrase \\"correct horse battery Suffix\\" -d file"\necho ordinary`, []],
+    [`ssh host "cli --password=\\"Secret\nSuffix\\" --verbose"\necho ordinary`, []],
+    [`It's set up. Run: cli --password 'Secret Suffix' --verbose\necho ordinary`, []],
+    [`sh -c "cli \\"--password\\" \\"Secret Suffix\\" --verbose"\necho ordinary`, []],
+    [`sh <<'EOF'\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\""\nEOF\necho ordinary`, []],
+    [`:;PASSWORD=correct\\ horse\\ SecretSuffix printenv PASSWORD\necho ordinary`, ['printenv PASSWORD', 'echo ordinary']],
+    [`case $(printf a) in a) :;; esac\ncli --password ghp_${'0'.repeat(36)}" ' SecretSuffix" --verbose`, ['--verbose']],
+    [`I'm stuck. Please run: mysql -u admin --password 'correct horse battery Suffix' -h db.internal app`, []],
+    [`env "DB_\\\n"PASSWORD=ghp_${'0'.repeat(36)}"Secret\nSuffix" printenv DB_PASSWORD\necho ordinary`, []],
+    [`cat <<EOF\nline one \\\ncontinued\nEOF\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\" --verbose"\necho ordinary`, ['line one']],
+    [`cat > deploy.sh <<'EOF'\nssh prod "mysql --password \\"correct horse Suffix\\" -e 'select 1'"\nEOF\nchmod +x deploy.sh`, []],
+    [`Use a 27" screen; sh -c "cli \\"--password Secret Suffix\\" run"\necho ordinary`, []],
+    [`cli "--pass\\\n"word SecretSuffix --verbose\necho ordinary`, []],
+    [`env "DB_PASS"WORD=SecretSuffix printenv DB_PASSWORD\necho ordinary`, ['echo ordinary']],
+    ['cli --password=\\\nSecretSuffix --verbose', []],
+    ['cli --password "$(cat <<EOF\ntext\\\nEOF\n) " SecretSuffix\nEOF\n)" --verbose', []],
+    ['cli --password $(printf %s A;#x )\nprintf %s SecretSuffix) --verbose', []],
+  ]
+  for (const [command, kept] of commands) {
+    const paths = pathsOf(command)
+    for (const [n, text] of paths.entries()) {
+      expect(text).not.toContain('Suffix')
+      // The last path is a second pass: it may redact more, never less.
+      if (n < paths.length - 1) for (const k of kept) expect(text).toContain(k)
+    }
+  }
+})
+
+test('round 8 and 9 review inputs leave no part of a credential in any path; a value whose end is not certain takes all that follows it', () => {
+  const token = `ghp_${'0'.repeat(36)}`
+  const cases: [string, string][] = [
+    // Round 8, A: prose, an odd quote or a lone backtick before a quoted value.
+    [`It's set up. Run: cli --password 'Secret Suffix' --verbose`, `It's set up. Run: cli --password [REDACTED]`],
+    [`Use a 27" screen; cli --password "Secret Suffix" --verbose`, `Use a 27" screen; cli --password [REDACTED]`],
+    [`Use a 27" screen; cli --password="Secret\nSuffix" --verbose\necho ordinary`, `Use a 27" screen; cli --password=[REDACTED]`],
+    [`I'm stuck. Please run: mysql -u admin --password 'correct horse battery Suffix' -h db.internal app`, `I'm stuck. Please run: mysql -u admin --password [REDACTED]`],
+    [`Here's the fix:\n\`\`\`\nPGPASSWORD='correct horse\nbattery Suffix' psql -h db app\n\`\`\``, `Here's the fix:\n\`\`\`\nPGPASSWORD=[REDACTED]`],
+    [`It's set up. Run: cli --password $'Secret Suffix' --verbose`, `It's set up. Run: cli --password [REDACTED]`],
+    [`It's set up. Run: cli --password "$(printf %s 'Secret Suffix')" --verbose`, `It's set up. Run: cli --password [REDACTED]`],
+    [`fn f(x: &'static str) {}\ncli --password 'Secret Suffix' --verbose`, `fn f(x: &'static str) {}\ncli --password [REDACTED]`],
+    [`Use the \` key; cli --password 'Secret Suffix' --verbose`, `Use the \` key; cli --password [REDACTED]`],
+    [`It's set up. Run: cli $'--pa\\x73sword' 'Secret Suffix' --verbose`, `It's set up. Run: cli $'--pa\\x73sword' [REDACTED]`],
+    [`echo "\${x:-it's}"\ncli --password 'Secret Suffix' --verbose`, `echo "\${x:-it's}"\ncli --password [REDACTED] --verbose`],
+    [`cli "a b"--password=[REDACTED]"Secret\nSuffix" --verbose`, `cli "a b"--password=[REDACTED]`],
+    // Round 8, B: a marker, or a token the token rule makes one, before the rest of a value.
+    [`env "DB_\\\n"PASSWORD=[REDACTED]"Secret\nSuffix" printenv DB_PASSWORD\necho ordinary`, `env "DB_\\\n"PASSWORD=[REDACTED]`],
+    [`env "DB_\\\n"PASSWORD=${token}"Secret\nSuffix" printenv DB_PASSWORD\necho ordinary`, `env "DB_\\\n"PASSWORD=[REDACTED]`],
+    // Round 8, C: a comment or a here-document line that ends in a backslash before a command string.
+    [`# note \\\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\" --verbose"\necho ordinary`, `# note \\\nsh -c "printf '<%s>\\n' --password [REDACTED]`],
+    [`cat <<EOF\nline one \\\ncontinued\nEOF\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\" --verbose"\necho ordinary`, `cat <<EOF\nline one \\\ncontinued\nEOF\nsh -c "printf '<%s>\\n' --password [REDACTED]`],
+    [`echo x # comment\\\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\" --verbose"\necho ordinary`, `echo x # comment\\\nsh -c "printf '<%s>\\n' --password [REDACTED]`],
+    [`case x in\na) :;; # arm\\\nb) :;;\nesac\nsh -c "printf '<%s>\\n' --password \\"Secret Suffix\\" --verbose"\necho ordinary`, `case x in\na) :;; # arm\\\nb) :;;\nesac\nsh -c "printf '<%s>\\n' --password [REDACTED]`],
+    // Round 8, D: a command string in a here-document, a comment or prose.
+    [`cat > deploy.sh <<'EOF'\n#!/bin/sh\nssh prod "mysql --password \\"correct horse battery Suffix\\" -e 'select 1'"\nEOF\nchmod +x deploy.sh`, `cat > deploy.sh <<'EOF'\n#!/bin/sh\nssh prod "mysql --password [REDACTED]`],
+    [`# usage: sh -c "cli --passphrase \\"correct horse Suffix\\" -d f"`, `# usage: sh -c "cli --passphrase [REDACTED]`],
+    [`See issue #42: ssh host "deploy --password \\"pass Suffix\\" now"`, `See issue #42: ssh host "deploy --password [REDACTED]`],
+    [`cat <<EOF\nssh host "deploy --password \\"pass Suffix\\" now"\nEOFX\nmore`, `cat <<EOF\nssh host "deploy --password [REDACTED]`],
+    // Round 8, E: a quoted part a continuation joins to a credential name.
+    [`cli "--pass\\\n"word SecretSuffix --verbose\necho ordinary`, `cli "--pass\\\n[REDACTED]`],
+    [`cli --pass\\\n"word" SecretSuffix --verbose\necho ordinary`, `cli --pass\\\n[REDACTED]`],
+    [`cli --pass\\\n'word' SecretSuffix --verbose\necho ordinary`, `cli --pass\\\n[REDACTED]`],
+    [`cli "--pass\\\r\n"word SecretSuffix --verbose\r\necho ordinary`, `cli "--pass\\\r\n[REDACTED]`],
+    [`cli --pass\\\r\n"word" SecretSuffix --verbose\r\necho ordinary`, `cli --pass\\\r\n[REDACTED]`],
+    // Round 9, A: an option word quoted or escaped in pieces, after prose, in a comment or a here-document.
+    [`Use a 27" screen; cli --"password" "Secret Suffix" --verbose`, `Use a 27" screen; cli --"password" [REDACTED]`],
+    [`Use a 27" screen; cli --'password' "Secret Suffix" --verbose`, `Use a 27" screen; cli --'password' [REDACTED]`],
+    [`Use a 27" screen; cli "--pass"word "Secret Suffix" --verbose`, `Use a 27" screen; cli "--pass"word [REDACTED]`],
+    [`Use a 27" screen; cli --pa\\ssword "Secret\nSuffix" --verbose`, `Use a 27" screen; cli --pa\\ssword [REDACTED]`],
+    [`Use a 27" screen; cli $'--pa\\x73sword' "Secret Suffix" --verbose`, `Use a 27" screen; cli $'--pa\\x73sword' [REDACTED]`],
+    [`Use a 27" screen; cli --"password" [REDACTED]"Secret Suffix" --verbose`, `Use a 27" screen; cli --"password" [REDACTED]`],
+    [`# Use a 27" screen; cli --"password" "Secret Suffix" --verbose`, `# Use a 27" screen; cli --"password" [REDACTED]`],
+    [`cat <<'EOF'\nUse a 27" screen; cli --"password" "Secret Suffix" --verbose\nEOF\necho ordinary`, `cat <<'EOF'\nUse a 27" screen; cli --"password" [REDACTED]`],
+    // Round 9, B: an escaped backtick in a command string.
+    [`Use a 27" screen; sh -c "cli --password \\\`printf %s SecretSuffix\\\` --verbose"`, `Use a 27" screen; sh -c "cli --password [REDACTED]`],
+    [`# Use a 27" screen; sh -c "cli --password \\\`printf %s SecretSuffix\\\` --verbose"`, `# Use a 27" screen; sh -c "cli --password [REDACTED]`],
+    [`cat <<'EOF'\nsh -c "cli --password \\\`printf %s SecretSuffix\\\` --verbose"\nEOF\necho ordinary`, `cat <<'EOF'\nsh -c "cli --password [REDACTED]`],
+    // Round 9, C: a command string's escaped or continued option name.
+    [`sh -c "cli --pa\\\\ssword \\"Secret Suffix\\" --verbose"`, `sh -c "cli --pa\\\\ssword [REDACTED]`],
+    [`sh -c "cli --pass\\\\\nword SecretSuffix --verbose"`, `sh -c "cli --pass\\\\\n[REDACTED]`],
+    [`sh -c "cli --pa\\\\ssword=\\"Secret Suffix\\" --verbose"\necho ordinary`, `sh -c "cli --pa\\\\ssword=[REDACTED]`],
+    [`sh -c "cli --pass\\\\\nword=SecretSuffix --verbose"\necho ordinary`, `sh -c "cli --pass\\\\\n[REDACTED]`],
+    // Round 9, D: a name joined from quoted or escaped parts after another option's `=`.
+    [`kubectl create secret generic demo --from-literal=pass"word"=SecretSuffix`, `kubectl create secret generic demo --from-literal=pass"word"=[REDACTED]`],
+    [`gcloud run deploy svc --set-env-vars=DB_PASS"WORD"=SecretSuffix --region us\necho ordinary`, `gcloud run deploy svc --set-env-vars=DB_PASS"WORD"=[REDACTED]\necho ordinary`],
+    [`terraform apply -var=db_pass"word"=SecretSuffix`, `terraform apply -var=db_pass"word"=[REDACTED]`],
+    [`kubectl create secret generic demo --from-literal=pass"word"="Secret\nSuffix" --dry-run=client\necho ordinary`, `kubectl create secret generic demo --from-literal=pass"word"=[REDACTED]\necho ordinary`],
+    [`kubectl create secret generic demo --from-literal=pass\\word=SecretSuffix --dry-run=client\necho ordinary`, `kubectl create secret generic demo --from-literal=pass\\word=[REDACTED]\necho ordinary`],
+    [`sh -c "kubectl create secret generic demo --from-literal=pass\\"word\\"='Secret Suffix'"\necho ordinary`, `sh -c "kubectl create secret generic demo --from-literal=pass\\"word\\"=[REDACTED]`],
+    // Arrays, comments and case statements in a substitution, and a continued name.
+    [`cli --password $(a=( # )\nx\n); printf %s SecretSuffix) --verbose\necho ordinary`, `cli --password [REDACTED]`],
+    [`cli --password=$(a=( # )\nx\n)\nprintf %s SecretSuffix) --verbose\necho ordinary`, `cli --password=[REDACTED]`],
+    [`cli --password prefix$(a=( # )\nx\n); printf %s SecretSuffix)suffix --verbose\necho ordinary`, `cli --password [REDACTED]`],
+    [`cli --password $(case y in (x) <esac;; y) printf %s SecretSuffix;; esac) --verbose`, `cli --password [REDACTED]`],
+    [`cli --pass\\\nword SecretSuffix --verbose`, `cli --pass\\\nword [REDACTED] --verbose`],
+  ]
+  for (const [input, want] of cases) {
+    expect(redactText(input, newStats())).toBe(want)
+    for (const text of pathsOf(input)) expect(text).not.toContain('Suffix')
+  }
+})
+
+test('a generated sweep: in each credential form, a value an expansion, a quote or a continuation opens runs to the end of the text in every path', () => {
+  // Values whose end the simple rules cannot tell.
+  const values = [
+    '$(printf %s pre SecretSuffix)',
+    '`printf %s pre SecretSuffix`',
+    '${X:-pre SecretSuffix}',
+    "$'pre SecretSuffix'",
+    '<(printf %s pre SecretSuffix)',
+    '"$(printf %s pre) SecretSuffix"',
+    '"pre SecretSuffix',
+    'pre\\\nSecretSuffix',
+  ]
+  // Each form, and what is left of it.
+  const forms: [(value: string) => string, string][] = [
+    [value => `cli --password ${value} --verbose\necho ordinary`, 'cli --password [REDACTED]'],
+    [value => `cli --password=${value} --verbose\necho ordinary`, 'cli --password=[REDACTED]'],
+    [value => `cli "--password"=${value} --verbose\necho ordinary`, 'cli "--password"=[REDACTED]'],
+    [value => `PASSWORD=${value} cli --verbose\necho ordinary`, 'PASSWORD=[REDACTED]'],
+  ]
+  for (const [form, left] of forms) {
+    for (const value of values) {
+      const command = form(value)
+      expect(redactText(command, newStats())).toBe(left)
+      for (const text of pathsOf(command)) {
+        expect(text).not.toMatch(/Secret|Suffix/)
+        // All that follows the value goes with it.
+        expect(text).not.toMatch(/--verbose|echo ordinary/)
+      }
+    }
+  }
+})
+
+test('a credential whose end the simple rules tell keeps what follows it, in every path', () => {
+  // Each command, what is left of it, and text after its value that is kept.
+  const cases: [string, string, string[]][] = [
+    ['cli --password plain --verbose', 'cli --password [REDACTED] --verbose', ['--verbose']],
+    ["--password 'a b' --verbose", '--password [REDACTED] --verbose', ['--verbose']],
+    ['--password=x;echo ok', '--password=[REDACTED];echo ok', ['echo ok']],
+    ['cli --password SecretSuffix --verbose', 'cli --password [REDACTED] --verbose', ['--verbose']],
+    ["cli --password 'Secret Suffix' --verbose\necho ordinary", 'cli --password [REDACTED] --verbose\necho ordinary', ['--verbose', 'echo ordinary']],
+    ['cli --password "Secret Suffix" --verbose', 'cli --password [REDACTED] --verbose', ['--verbose']],
+    ['cli --password Secret\\ Suffix --verbose', 'cli --password [REDACTED] --verbose', ['--verbose']],
+    [`cli --password 'Secret '"Suffix"x --verbose`, 'cli --password [REDACTED] --verbose', ['--verbose']],
+    ['cli --password "pre\\"SecretSuffix" --verbose', 'cli --password [REDACTED] --verbose', ['--verbose']],
+    ['cli --password=SecretSuffix;echo ok', 'cli --password=[REDACTED];echo ok', ['echo ok']],
+    ['cli --password=SecretSuffix|tee out.log', 'cli --password=[REDACTED]|tee out.log', ['tee out.log']],
+    ['cli --password SecretSuffix && echo ok', 'cli --password [REDACTED] && echo ok', ['echo ok']],
+    ['(cli --password SecretSuffix) && echo ok', '(cli --password [REDACTED]) && echo ok', ['echo ok']],
+    ['cli --password SecretSuffix>out.txt', 'cli --password [REDACTED]>out.txt', ['out.txt']],
+    ['cli "--password Secret Suffix" --verbose', 'cli "--password [REDACTED]" --verbose', ['--verbose']],
+    ['cmd;PASSWORD="Secret Suffix" cli --verbose', 'cmd;PASSWORD=[REDACTED] cli --verbose', ['cli --verbose']],
+    ['env "DB_"PASSWORD="Secret\nSuffix" printenv DB_PASSWORD\necho ordinary', 'env "DB_"PASSWORD=[REDACTED]\necho ordinary', ['echo ordinary']],
+    ["mysql -u admin --password 'correct horse battery Suffix' -h db.internal app", 'mysql -u admin --password [REDACTED] -h db.internal app', ['-h db.internal app']],
+    ["cli $'--pa\\x73sword' SecretSuffix --verbose", "cli $'--pa\\x73sword' [REDACTED] --verbose", ['--verbose']],
+    ['cli --pass\\\nword SecretSuffix --verbose\necho ordinary', 'cli --pass\\\nword [REDACTED] --verbose\necho ordinary', ['--verbose', 'echo ordinary']],
+    ['kubectl create secret generic demo --from-literal=pass"word"=SecretSuffix --dry-run=client\necho ordinary', 'kubectl create secret generic demo --from-literal=pass"word"=[REDACTED]\necho ordinary', ['echo ordinary']],
+  ]
+  for (const [command, want, kept] of cases) {
+    expect(redactText(command, newStats())).toBe(want)
+    for (const text of pathsOf(command)) {
+      expect(text).not.toContain('Suffix')
+      for (const k of kept) expect(text).toContain(k)
+    }
+  }
+})
+
+test('text with no credential is left as it is, byte for byte, in every path', () => {
+  const commands = [
+    'printf %s case',
+    'cat <<EOF\nhi\nEOF\necho ordinary',
+    'echo abc#def',
+    'echo $((1 << 2))',
+    'ls --verbose',
+    '#!/bin/sh\nset -eu\n# build, then list\nfor f in *.txt; do\n  printf \'%s\\n\' "$f" | tr a-z A-Z > "out/$f"\ndone\ncase "$1" in\n  start) echo start;;\n  *) echo "usage: $0 start" >&2; exit 1;;\nesac\nx=$(date +%s)\ny=`whoami`\necho "${x:-0} $y" 2>&1 | tee log.txt',
+    `git log --format='%H %s' -n 3 && echo "it's done"`,
+    'docker login --password-stdin registry.example.com',
+    'cli --password\\\n-stdin host',
+    'cli --password\\\n"-stdin" host\necho ordinary',
+    'sh -c "cli --password\\\\\n-stdin host"',
+    'tool --token-file /etc/token --verbose',
+    'cli --max-tokens 1024',
+    'cli --password --verbose',
+  ]
+  const commandOf = (content: string | undefined): string => (JSON.parse(content ?? '{}') as { args?: { command?: string } }).args?.command ?? ''
+  for (const command of commands) {
+    const [once, content = 'null', error, request = '{}', , lines = '[]', diagnostic, twice] = pathsOf(command)
+    expect([once, twice, error, diagnostic]).toEqual([command, command, `command failed: ${command}`, `command failed: ${command}`])
+    expect(commandOf(JSON.parse(content) as string)).toBe(command)
+    expect(commandOf((JSON.parse(request) as { rows: { json: { content: string } }[] }).rows[0]?.json.content)).toBe(command)
+    expect(commandOf((JSON.parse(lines) as { row: { content: string } }[])[0]?.row.content)).toBe(command)
+  }
+})
