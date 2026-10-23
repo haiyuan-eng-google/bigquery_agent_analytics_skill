@@ -307,7 +307,13 @@ claude plugin install bigquery-agent-analytics-tracing@bigquery-agent-analytics-
 
 Restart Claude Code after installation. Hooks load at session start.
 
-Verify:
+Verify the hooks stay fast and fail open (no GCP access needed):
+
+```bash
+python plugins/bigquery-agent-analytics-tracing/scripts/test_hook_nonblocking.py
+```
+
+Verify live:
 
 1. Start a new Claude Code session.
 2. Run a prompt that uses a tool.
@@ -566,7 +572,15 @@ ORDER BY events DESC;
 ## 10. Troubleshooting
 
 - No rows: check `BQAA_PROJECT_ID`, `BQAA_DATASET`, credentials, and
-  `BQAA_DRY_RUN`.
+  `BQAA_DRY_RUN`. Without a project and dataset (and outside dry-run) the
+  hooks exit without starting Python, so nothing is logged either.
+- Tool calls stall: each hook returns within about
+  `BQAA_HOOK_WAIT_SECONDS` (default 1) no matter what Python, auth or
+  BigQuery are doing. Multi-minute stalls on every tool call mean an older
+  copy of the plugin is installed; update it and start a new session.
+- Rows arrive late: while Python can't start, events wait in
+  `BQAA_STATE_DIR/queue/`. The session's next hook whose Python gets going
+  writes them, in order and with the times their hooks ran.
 - Rows stuck in spool: check `BQAA_SPOOL_DIR/dead-letter/` and
   `BQAA_LOG_FILE`.
 - Claude Code rows missing: restart Claude Code after installing the
